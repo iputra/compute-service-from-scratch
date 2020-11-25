@@ -1,0 +1,161 @@
+# Update system
+apt update; apt upgrade -y
+apt install cloud-image-utils qemu-system-x86
+
+# Create project directory
+mkdir compute-service; cd compute-service
+mkdir -p lib/images lib/volumes
+mkdir -p run/instances
+
+# Setup environment
+export compute_service_root=/root/compute-service
+export images_path=${compute_service_root}/lib/images
+export volumes_path=${compute_service_root}/lib/volumes
+export instances_path=${compute_service_root}/run/instances
+
+# Start building
+# 1. Provide Image
+cd $images_path
+
+wget https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+wget https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
+wget https://cloud-images.ubuntu.com/xenial/current/xenial-server-cloudimg-amd64-disk1.img
+wget https://download.cirros-cloud.net/0.5.1/cirros-0.5.1-x86_64-disk.img
+
+cd $compute_service_root
+
+# 2. Provide Network
+remote_host=10.90.90.222
+vni=99
+net_uuid=$(uuidgen -t | cut -d "-" -f1)
+
+# Execute on ik-node-01
+# Create overlay network
+ip link add dev gnv-${net_uuid} type geneve remote ${remote_host} vni ${vni}
+ip link set gnv-${net_uuid} up
+
+# create bridge for tunnel network
+ip link add br-gnv-${net_uuid} type bridge
+ip link set dev br-gnv-${net_uuid} up
+ip link set gnv-${net_uuid} master br-gnv-${net_uuid}
+
+# Add gateway for accessing instance
+ip addr add 192.168.88.1/24 dev br-gnv-${net_uuid}
+
+# (Opsional) Testing with veth-pair
+interface_veth_pair_uuid=$(uuidgen -t | cut -d "-" -f1)
+ip link add veth-${interface_veth_pair_uuid} type veth peer name vpeer-${interface_veth_pair_uuid}
+ip link set vpeer-${interface_veth_pair_uuid} master br-gnv-${net_uuid}
+ip link set vpeer-${interface_veth_pair_uuid} up
+ip link set veth-${interface_veth_pair_uuid} up
+
+ip addr add 192.168.88.11/24 dev veth-${interface_veth_pair_uuid}
+
+# For instance get internet access
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -o ens3 -j MASQUERADE
+iptables -A FORWARD -i br-gnv-${net_uuid} -o ens3 -j ACCEPT
+
+# Execute on ik-node-01 for configuring ik-node-02
+remote_host=10.90.90.111
+vni=88
+
+ssh 10.90.90.222 /bin/bash <<EOF
+  ip link add dev gnv-${net_uuid} type geneve \
+    remote ${remote_host} vni ${vni}
+  ip link set gnv-${net_uuid} up
+
+  ip link add br-gnv-${net_uuid} type bridge
+  ip link set dev br-gnv-${net_uuid} up
+  ip link set gnv-${net_uuid} master br-gnv-${net_uuid}
+EOF
+
+# (Opsional) Execute on ik-node-02
+# (Opsional) Testing with veth-pair
+interface_veth_pair_uuid=$(uuidgen -t | cut -d "-" -f1)
+ip link add veth-${interface_veth_pair_uuid} type veth peer name vpeer-${interface_veth_pair_uuid}
+ip link set vpeer-${interface_veth_pair_uuid} master br-gnv-732bc0a4
+ip link set vpeer-${interface_veth_pair_uuid} up
+ip link set veth-${interface_veth_pair_uuid} up
+
+ip addr add 192.168.88.22/24 dev veth-${interface_veth_pair_uuid}
+ping -c 2 192.168.88.11
+
+# 3. Create Compute
+# Execute ik-node-01
+# Setup instance variable
+compute_uuid=$(uuidgen | cut -d '-' -f1)
+pubkey=$(cat ~/.ssh/id_rsa.pub)
+vnc_port=":1"
+ip_addr="192.168.88.201"
+gateway="192.168.88.1"
+cpu=2
+memory=4096
+net_uuid=e106dc66
+disk_size=10G
+
+# Create directory for instance
+mkdir ${instances_path}/compute-${compute_uuid}
+cat > ${instances_path}/compute-${compute_uuid}/net_1.cfg <<EOF 
+version: 2
+ethernets:
+  ens3:
+     dhcp4: false
+     addresses: [ ${ip_addr}/24 ]
+     gateway4: ${gateway}
+     nameservers:
+       addresses: [ ${gateway},8.8.8.8 ]
+EOF
+
+# Setup cloud-config for instance
+cat > ${instances_path}/compute-${compute_uuid}/cloud_init.cfg <<EOF
+#cloud-config
+hostname: ${compute_uuid}
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    home: /home/ubuntu
+    shell: /bin/bash
+    lock_passwd: false
+    ssh-authorized-keys:
+      - ${pubkey}
+ssh_pwauth: True
+chpasswd:
+  list: |
+    ubuntu:ubuntu
+  expire: False
+EOF
+
+# Generate image seed for instance data
+cloud-localds -v \
+--network-config=${instances_path}/compute-${compute_uuid}/net_1.cfg \
+${volumes_path}/compute-${compute_uuid}-seed.qcow2 \
+${instances_path}/compute-${compute_uuid}/cloud_init.cfg
+
+# Copy cloud image to the new instance
+cp ${images_path}/bionic-server-cloudimg-amd64.img \
+${volumes_path}/compute-${compute_uuid}.img
+
+# Resize disk instance
+qemu-img resize ${volumes_path}/compute-${compute_uuid}.img ${disk_size}
+
+# Create tap interface for nic instance
+ip tuntap add dev vnet-${compute_uuid} mode tap
+ip link set dev vnet-${compute_uuid} up
+ip link set vnet-${compute_uuid} master br-gnv-${net_uuid}
+
+# Run instance
+mac_addr=$(echo -n 02; od -t x1 -An -N 5 /dev/urandom | tr ' ' ':')
+qemu-system-x86_64 -smp ${cpu} -m ${memory} \
+  -drive file=${volumes_path}/compute-${compute_uuid}.img,format=qcow2,if=virtio \
+  -drive file=${volumes_path}/compute-${compute_uuid}-seed.qcow2,format=raw,if=virtio \
+  -boot order=c,menu=off \
+  -enable-kvm \
+  -cpu host \
+  -device virtio-net-pci,netdev=network0,mac=${mac_addr} \
+  -netdev tap,id=network0,ifname=vnet-${compute_uuid},script=no,downscript=no \
+  -daemonize -vnc ${vnc_port} &
+
+echo $! > ${instances_path}/compute-${compute_uuid}/compute-${compute_uuid}.pid
+
